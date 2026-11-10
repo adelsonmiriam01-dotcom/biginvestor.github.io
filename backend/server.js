@@ -1,199 +1,201 @@
--- ============================================================
---  HASHAAVA / IHRA — FULL SCHEMA
---  Paste this entire file into Supabase SQL Editor and Run.
---  Safe to run more than once (idempotent).
--- ============================================================
+import express from 'express';
+import cors from 'cors';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import 'dotenv/config';
 
-create extension if not exists "pgcrypto";
+import { supabase } from './lib/supabase.js';
+import { sendApprovalEmail } from './lib/email.js';
+import { resolveLanguage } from './lib/i18n.js';
 
--- ------------------------------------------------------------
--- 1. Applications table
--- ------------------------------------------------------------
-create table if not exists public.applications (
-  id                  uuid primary key default gen_random_uuid(),
-  first_name          text        not null,
-  middle_name         text,
-  last_name           text        not null,
-  dob                 date        not null,
-  gender              text,
-  country             text        not null,
-  country_code        text,
-  email               text        not null,
-  phone               text        not null,
-  ip                  text,
-  language            text        not null default 'en',
-  face_verified       boolean     not null default false,
-  status              text        not null default 'approved_pending_email',
-  email_sent          boolean     not null default false,
-  email_sent_at       timestamptz,
-  email_error         text,
-  email_attempts      int         not null default 0,
-  scheduled_send_at   timestamptz not null,
-  created_at          timestamptz not null default now(),
-  updated_at          timestamptz not null default now()
-);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const app = express();
+app.set('trust proxy', 1);            // ← REQUIRED for real IP on Render
+app.use(cors());
+app.use(express.json({ limit: '128kb' }));
+app.use('/public', express.static(path.join(__dirname, 'public')));
 
--- ------------------------------------------------------------
--- 2. Visits table (IP tracking)
--- ------------------------------------------------------------
-create table if not exists public.visits (
-  id           uuid primary key default gen_random_uuid(),
-  ip           text,
-  country      text,
-  country_code text,
-  language     text not null default 'en',
-  user_agent   text,
-  created_at   timestamptz not null default now()
-);
+const EMAIL_DELAY_MINUTES = Number(process.env.EMAIL_DELAY_MINUTES || 10);
+const PORT = process.env.PORT || 3000;
 
--- ------------------------------------------------------------
--- 3. Constraints
--- ------------------------------------------------------------
-do $$
-begin
-  if not exists (select 1 from pg_constraint where conname = 'applications_email_format') then
-    alter table public.applications
-      add constraint applications_email_format
-      check (email ~* '^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$');
-  end if;
+/* ============================================================
+   IP HELPERS
+   ============================================================ */
+const T_LANGS = ['en','he','ar','es','fr','de','ru','pl','pt','it'];
 
-  if not exists (select 1 from pg_constraint where conname = 'applications_status_check') then
-    alter table public.applications
-      add constraint applications_status_check
-      check (status in ('approved_pending_email','emailed','failed','cancelled'));
-  end if;
+const CC_LANG = {
+  IL:'he', PL:'pl', US:'en', FR:'fr', GB:'en', CA:'en', AR:'es', RU:'ru', UA:'ru',
+  DE:'de', HU:'en', AU:'en', ZA:'en', BR:'pt', MX:'es', BY:'ru', LT:'en', LV:'en',
+  RO:'en', CZ:'en', AT:'de', NL:'en', BE:'fr', SE:'en', CH:'de', ES:'es', IT:'it',
+  TR:'en', IR:'en', MA:'ar', TN:'ar', EG:'ar', IQ:'ar', YE:'ar', SY:'ar', LB:'ar',
+  IN:'en', CN:'en', JP:'en', NZ:'en', IE:'en', PT:'pt', GR:'en', BG:'en', RS:'en',
+  HR:'en', SK:'en', SI:'en', MD:'en', GE:'en', AZ:'en', KZ:'ru', UZ:'ru', EE:'en',
+  FI:'en', NO:'en', DK:'en'
+};
 
-  if not exists (select 1 from pg_constraint where conname = 'applications_language_check') then
-    alter table public.applications
-      add constraint applications_language_check
-      check (language in ('en','he','ar','es','fr','de','ru','pl','pt','it'));
-  end if;
-end
-$$;
+function getClientIp(req) {
+  const xff = req.headers['x-forwarded-for'];
+  if (xff) {
+    const first = String(xff).split(',')[0].trim();
+    if (first) return first;
+  }
+  return req.ip || '';
+}
 
--- ------------------------------------------------------------
--- 4. Indexes
--- ------------------------------------------------------------
-create index if not exists idx_applications_pending_email
-  on public.applications (scheduled_send_at)
-  where email_sent = false;
+function isPrivateIP(ip) {
+  if (!ip) return true;
+  if (ip === '::1' || ip === '127.0.0.1' || ip === 'localhost') return true;
+  if (/^10\./.test(ip)) return true;
+  if (/^192\.168\./.test(ip)) return true;
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(ip)) return true;
+  if (/^(fc|fd)/i.test(ip)) return true;
+  return false;
+}
 
-create index if not exists idx_applications_email
-  on public.applications (email);
+async function lookupCountry(ip) {
+  if (!ip || isPrivateIP(ip)) return { country: null, country_code: null };
+  try {
+    const r = await fetch(`https://ipapi.co/${ip}/json/`, {
+      headers: { 'User-Agent': 'hashava-backend' }
+    });
+    if (!r.ok) return { country: null, country_code: null };
+    const data = await r.json();
+    return {
+      country: data.country_name || null,
+      country_code: data.country_code || null
+    };
+  } catch {
+    return { country: null, country_code: null };
+  }
+}
 
-create index if not exists idx_applications_country
-  on public.applications (country);
+/* ============================================================
+   VISIT TRACKING — IP logged on every page visit
+   ============================================================ */
+app.post('/api/visit', async (req, res) => {
+  try {
+    const ip = getClientIp(req);
+    const ua = (req.headers['user-agent'] || '').slice(0, 500);
+    const hint = String((req.body && req.body.hintLang) || 'en').toLowerCase();
+    const fallback = T_LANGS.includes(hint) ? hint : 'en';
 
-create index if not exists idx_applications_created_at
-  on public.applications (created_at desc);
+    const geo = await lookupCountry(ip);
+    const language = (geo.country_code && CC_LANG[geo.country_code]) || fallback;
 
-create index if not exists idx_visits_created_at
-  on public.visits (created_at desc);
+    await supabase.from('visits').insert({
+      ip: ip || null,
+      country: geo.country,
+      country_code: geo.country_code,
+      language,
+      user_agent: ua
+    });
 
-create index if not exists idx_visits_ip
-  on public.visits (ip);
+    res.json({ language, country: geo.country, country_code: geo.country_code });
+  } catch (err) {
+    console.error('[visit]', err?.message || err);
+    res.json({ language: 'en' });
+  }
+});
 
-create index if not exists idx_visits_country_code
-  on public.visits (country_code);
+/* ============================================================
+   APPLICATIONS
+   ============================================================ */
+app.post('/api/applications', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const required = ['firstName', 'lastName', 'dob', 'country', 'email', 'phone'];
+    for (const k of required) {
+      if (!b[k] || String(b[k]).trim() === '') {
+        return res.status(400).json({ error: `Missing required field: ${k}` });
+      }
+    }
 
--- ------------------------------------------------------------
--- 5. Auto-update updated_at
--- ------------------------------------------------------------
-create or replace function public.set_updated_at()
-returns trigger language plpgsql as $$
-begin
-  new.updated_at = now();
-  return new;
-end;
-$$;
+    const lang = typeof b.language === 'string' && b.language
+      ? b.language
+      : resolveLanguage(b.country);
 
-drop trigger if exists trg_applications_updated_at on public.applications;
-create trigger trg_applications_updated_at
-  before update on public.applications
-  for each row
-  execute function public.set_updated_at();
+    const scheduledSendAt = new Date(Date.now() + EMAIL_DELAY_MINUTES * 60 * 1000).toISOString();
 
--- ------------------------------------------------------------
--- 6. RLS — locked down (backend uses service_role key)
--- ------------------------------------------------------------
-alter table public.applications enable row level security;
-alter table public.visits enable row level security;
+    const ip = getClientIp(req);
+    const geo = await lookupCountry(ip);
 
--- ------------------------------------------------------------
--- 7. Views
--- ------------------------------------------------------------
-create or replace view public.v_pending_emails as
-select
-  id, email, language, country, scheduled_send_at, email_attempts,
-  greatest(0, extract(epoch from (scheduled_send_at - now()))::int) as seconds_remaining
-from public.applications
-where email_sent = false
-  and status = 'approved_pending_email';
+    const { data, error } = await supabase
+      .from('applications')
+      .insert({
+        ip: ip || null,
+        country_code: geo.country_code || null,
+        first_name:      String(b.firstName).trim(),
+        middle_name:     b.middleName ? String(b.middleName).trim() : null,
+        last_name:       String(b.lastName).trim(),
+        dob:             b.dob,
+        gender:          b.gender || null,
+        country:         String(b.country).trim(),
+        email:           String(b.email).trim().toLowerCase(),
+        phone:           String(b.phone).trim(),
+        language:        lang,
+        face_verified:   !!b.faceVerified,
+        scheduled_send_at: scheduledSendAt,
+        status:          'approved_pending_email',
+      })
+      .select()
+      .single();
 
-create or replace view public.v_email_stats as
-select
-  language, country,
-  count(*)                                            as total,
-  count(*) filter (where email_sent)                  as sent,
-  count(*) filter (where not email_sent)              as pending,
-  count(*) filter (where status = 'failed')           as failed,
-  max(created_at)                                     as last_created
-from public.applications
-group by language, country
-order by total desc;
+    if (error) throw error;
 
-create or replace view public.v_visits_summary as
-select
-  coalesce(country_code, '??')                        as country_code,
-  coalesce(country, 'Unknown')                        as country,
-  count(*)                                            as total_visits,
-  count(*) filter (where created_at > now() - interval '24 hours') as last_24h,
-  max(created_at)                                     as last_visit
-from public.visits
-group by country_code, country
-order by total_visits desc;
+    console.log('[application created]', data.id, lang, 'send at', scheduledSendAt);
+    res.json({ ok: true, id: data.id, language: lang, scheduled_send_at: scheduledSendAt });
+  } catch (err) {
+    console.error('[create application]', err?.message || err);
+    res.status(500).json({ error: 'Failed to create application' });
+  }
+});
 
--- ------------------------------------------------------------
--- 8. RPC — atomic "claim due emails"
--- ------------------------------------------------------------
-create or replace function public.claim_due_emails(batch_limit int default 15)
-returns setof public.applications
-language plpgsql
-security definer
-set search_path = public
-as $$
-declare
-  claimed_ids uuid[];
-begin
-  with due as (
-    select id from public.applications
-    where email_sent = false
-      and status = 'approved_pending_email'
-      and scheduled_send_at <= now()
-    order by scheduled_send_at asc
-    limit batch_limit
-    for update skip locked
-  )
-  update public.applications a
-    set email_attempts = a.email_attempts + 1
-    from due
-    where a.id = due.id
-    returning a.id into claimed_ids;
+/* ============================================================
+   EMAIL SWEEP LOOP
+   ============================================================ */
+async function sweepDueEmails() {
+  try {
+    const nowIso = new Date().toISOString();
+    const { data, error } = await supabase
+      .from('applications')
+      .select('*')
+      .eq('email_sent', false)
+      .lte('scheduled_send_at', nowIso)
+      .limit(15);
 
-  return query
-    select * from public.applications
-    where id = any(claimed_ids)
-    order by scheduled_send_at asc;
-end;
-$$;
+    if (error) throw error;
+    if (!data || data.length === 0) return;
 
-revoke all on function public.claim_due_emails(int) from public;
-revoke all on function public.claim_due_emails(int) from anon, authenticated;
+    for (const row of data) {
+      try {
+        await sendApprovalEmail(row);
+        await supabase
+          .from('applications')
+          .update({ email_sent: true, email_sent_at: new Date().toISOString(), status: 'emailed' })
+          .eq('id', row.id);
+        console.log('[email sent]', row.id, '→', row.email, `(${row.language})`);
+      } catch (err) {
+        console.error('[email failed]', row.id, err?.message || err);
+      }
+    }
+  } catch (err) {
+    console.error('[sweep]', err?.message || err);
+  }
+}
 
--- ------------------------------------------------------------
--- 9. Sanity check
--- ------------------------------------------------------------
-select
-  (select count(*) from public.applications)     as total_applications,
-  (select count(*) from public.visits)           as total_visits,
-  (select count(*) from public.v_pending_emails) as pending_emails;
+setInterval(sweepDueEmails, 30_000);
+sweepDueEmails();
+
+/* ============================================================
+   HEALTH / CRON
+   ============================================================ */
+app.get('/health', (_req, res) => res.json({ ok: true }));
+app.get('/', (_req, res) => res.json({ ok: true, service: 'hashava-backend', ts: Date.now() }));
+app.post('/api/cron/send-pending', async (_req, res) => {
+  await sweepDueEmails();
+  res.json({ ok: true });
+});
+
+app.listen(PORT, () => {
+  console.log(`[hashava-backend] listening on :${PORT} (delay ${EMAIL_DELAY_MINUTES} min)`);
+});
