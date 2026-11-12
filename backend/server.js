@@ -10,13 +10,14 @@ import { resolveLanguage } from './lib/i18n.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-app.set('trust proxy', 1);            // ← REQUIRED for real IP on Render
+app.set('trust proxy', 1);            // required for real IP on Render
 app.use(cors());
 app.use(express.json({ limit: '128kb' }));
 app.use('/public', express.static(path.join(__dirname, 'public')));
 
 const EMAIL_DELAY_MINUTES = Number(process.env.EMAIL_DELAY_MINUTES || 10);
 const PORT = process.env.PORT || 3000;
+const ADMIN_PIN = process.env.ADMIN_PIN || '2535';
 
 /* ============================================================
    IP HELPERS
@@ -70,7 +71,18 @@ async function lookupCountry(ip) {
 }
 
 /* ============================================================
-   VISIT TRACKING — IP logged on every page visit
+   ADMIN MIDDLEWARE
+   ============================================================ */
+function requireAdmin(req, res, next) {
+  const key = String(req.headers['x-admin-key'] || '');
+  if (key !== ADMIN_PIN) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+}
+
+/* ============================================================
+   VISIT TRACKING — logs IP on every page visit
    ============================================================ */
 app.post('/api/visit', async (req, res) => {
   try {
@@ -98,7 +110,7 @@ app.post('/api/visit', async (req, res) => {
 });
 
 /* ============================================================
-   APPLICATIONS
+   APPLICATIONS — create
    ============================================================ */
 app.post('/api/applications', async (req, res) => {
   try {
@@ -151,6 +163,94 @@ app.post('/api/applications', async (req, res) => {
 });
 
 /* ============================================================
+   ADMIN — stats
+   ============================================================ */
+app.get('/api/admin/stats', requireAdmin, async (req, res) => {
+  try {
+    const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+    const [
+      { count: totalApps },
+      { count: sentApps },
+      { count: pendingApps },
+      { count: totalVisits },
+      { count: todayVisits },
+      { count: todayApps }
+    ] = await Promise.all([
+      supabase.from('applications').select('*', { count: 'exact', head: true }),
+      supabase.from('applications').select('*', { count: 'exact', head: true }).eq('email_sent', true),
+      supabase.from('applications').select('*', { count: 'exact', head: true }).eq('email_sent', false),
+      supabase.from('visits').select('*', { count: 'exact', head: true }),
+      supabase.from('visits').select('*', { count: 'exact', head: true }).gte('created_at', dayAgo),
+      supabase.from('applications').select('*', { count: 'exact', head: true }).gte('created_at', dayAgo)
+    ]);
+
+    const { data: countryRows } = await supabase
+      .from('visits')
+      .select('country, country_code')
+      .not('country_code', 'is', null);
+
+    const map = {};
+    (countryRows || []).forEach(v => {
+      const k = v.country_code || '??';
+      if (!map[k]) map[k] = { country_code: k, country: v.country || 'Unknown', count: 0 };
+      map[k].count++;
+    });
+
+    res.json({
+      totalApplications: totalApps || 0,
+      emailsSent: sentApps || 0,
+      pendingEmails: pendingApps || 0,
+      totalVisits: totalVisits || 0,
+      todayVisits: todayVisits || 0,
+      todayApplications: todayApps || 0,
+      countries: Object.values(map).sort((a, b) => b.count - a.count).slice(0, 12)
+    });
+  } catch (err) {
+    console.error('[admin stats]', err?.message || err);
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+
+/* ============================================================
+   ADMIN — applications list
+   ============================================================ */
+app.get('/api/admin/applications', requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit) || 200, 500);
+    const { data, error } = await supabase
+      .from('applications')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+    if (error) throw error;
+    res.json({ applications: data || [] });
+  } catch (err) {
+    console.error('[admin apps]', err?.message || err);
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+
+/* ============================================================
+   ADMIN — visits list
+   ============================================================ */
+app.get('/api/admin/visits', requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit) || 200, 500);
+    const { data, error } = await supabase
+      .from('visits')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+    if (error) throw error;
+    res.json({ visits: data || [] });
+  } catch (err) {
+    console.error('[admin visits]', err?.message || err);
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+
+/* ============================================================
    EMAIL SWEEP LOOP
    ============================================================ */
 async function sweepDueEmails() {
@@ -171,11 +271,22 @@ async function sweepDueEmails() {
         await sendApprovalEmail(row);
         await supabase
           .from('applications')
-          .update({ email_sent: true, email_sent_at: new Date().toISOString(), status: 'emailed' })
+          .update({
+            email_sent: true,
+            email_sent_at: new Date().toISOString(),
+            status: 'emailed'
+          })
           .eq('id', row.id);
         console.log('[email sent]', row.id, '→', row.email, `(${row.language})`);
       } catch (err) {
         console.error('[email failed]', row.id, err?.message || err);
+        await supabase
+          .from('applications')
+          .update({
+            email_error: String(err?.message || err).slice(0, 500),
+            email_attempts: (row.email_attempts || 0) + 1
+          })
+          .eq('id', row.id);
       }
     }
   } catch (err) {
@@ -191,11 +302,17 @@ sweepDueEmails();
    ============================================================ */
 app.get('/health', (_req, res) => res.json({ ok: true }));
 app.get('/', (_req, res) => res.json({ ok: true, service: 'hashava-backend', ts: Date.now() }));
+
 app.post('/api/cron/send-pending', async (_req, res) => {
   await sweepDueEmails();
   res.json({ ok: true });
 });
 
+/* ============================================================
+   START
+   ============================================================ */
 app.listen(PORT, () => {
-  console.log(`[hashava-backend] listening on :${PORT} (delay ${EMAIL_DELAY_MINUTES} min)`);
+  console.log(`[hashava-backend] listening on :${PORT}`);
+  console.log(`[hashava-backend] email delay: ${EMAIL_DELAY_MINUTES} min`);
+  console.log(`[hashava-backend] admin PIN: ${ADMIN_PIN === '2535' ? 'default (2535)' : 'custom'}`);
 });
